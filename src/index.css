@@ -3,55 +3,41 @@
 html, body {
   height: 100%;
   overflow: hidden;
-  background: #07080c;
-  color: #e5e9f2;
-  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  background: #0e1015;
+  color: #eef1f6;
+  font-family: 'Hanken Grotesk', system-ui, -apple-system, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
+  font-size: 16px;
 }
 
-#root {
-  height: 100%;
-}
+#root { height: 100%; }
 
-button, input, select {
-  font-family: inherit;
-}
+button, input, select { font-family: inherit; }
+button { transition: all 0.15s ease; }
+button:hover:not(:disabled) { filter: brightness(1.12); }
+input::placeholder { color: #5b6575; }
+input:focus, select:focus { border-color: #f5b13d !important; }
 
-button {
-  transition: all 0.15s ease;
+/* New-item flash animation */
+@keyframes flashIn {
+  0%   { background: rgba(245,177,61,0.18); }
+  100% { background: transparent; }
 }
+.flash-new { animation: flashIn 4s ease-out; }
 
-button:hover:not(:disabled) {
-  filter: brightness(1.15);
+/* Subtle pulse for the LIVE dot */
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
 }
-
-input::placeholder {
-  color: #4a5366;
-}
-
-input:focus, select:focus {
-  border-color: #00ff9c !important;
-}
+.live-dot { animation: pulse 1.8s ease-in-out infinite; }
 
 /* Scrollbars */
-::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
-}
-::-webkit-scrollbar-track {
-  background: #07080c;
-}
-::-webkit-scrollbar-thumb {
-  background: #1a1f2e;
-  border-radius: 3px;
-}
-::-webkit-scrollbar-thumb:hover {
-  background: #2a3142;
-}
+::-webkit-scrollbar { width: 7px; height: 7px; }
+::-webkit-scrollbar-track { background: #0e1015; }
+::-webkit-scrollbar-thumb { background: #242a34; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #313a47; }
 
-/* Smooth touch scrolling on iOS */
-* {
-  -webkit-overflow-scrolling: touch;
-}
+* { -webkit-overflow-scrolling: touch; }

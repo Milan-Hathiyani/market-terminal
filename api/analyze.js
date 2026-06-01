@@ -1,4 +1,4 @@
-// Vercel serverless function - runs dual AI analysis server-side (avoids browser CORS blocks)
+// Vercel serverless function - dual AI analysis (server-side, avoids browser CORS)
 const GROQ_KEY = process.env.VITE_GROQ_API_KEY || process.env.GROQ_API_KEY
 const GEMINI_KEY = process.env.VITE_GEMINI_API_KEY || process.env.GEMINI_API_KEY
 
@@ -8,7 +8,7 @@ Headline: "${title}"
 ${summary ? `Context: "${String(summary).slice(0, 300)}"` : ''}
 
 Return exactly this format:
-{"impact":"HIGH","instruments":["USD ↑","Gold ↓","S&P500 ↑"],"verdict":"One sentence on market impact"}
+{"impact":"HIGH","instruments":["USD ↑","Gold ↓","S&P500 ↑"],"summary":"One factual sentence on what happened","verdict":"One sentence on market impact and direction"}
 
 Impact rules:
 - HIGH = Central bank decisions, wars/conflicts, market crashes, major surprise earnings, geopolitical crises, large M&A
@@ -16,18 +16,17 @@ Impact rules:
 - LOW = Minor company updates, routine news, lifestyle/non-market content
 
 Instrument rules:
-- Always include directional arrows (↑ for up, ↓ for down)
-- Use clear tickers: USD, EUR, GBP, JPY, Gold, Silver, Oil, S&P500, Nasdaq, BTC, ETH, AAPL, TSLA, etc.
-- Only include instruments clearly affected, maximum 5`
+- Always include directional arrows (↑ up, ↓ down)
+- Clear tickers: USD, EUR, GBP, JPY, Gold, Silver, Oil, S&P500, Nasdaq, BTC, ETH, AAPL, TSLA, etc.
+- Only instruments clearly affected, maximum 5
+- "summary" = plain factual recap. "verdict" = the trading/market takeaway.`
 
 function safeParse(text) {
   if (!text) return null
-  try {
-    return JSON.parse(text.replace(/```json|```/g, '').trim())
-  } catch (e) {
-    // Try to find JSON object in the text
-    const match = text.match(/\{[\s\S]*\}/)
-    if (match) { try { return JSON.parse(match[0]) } catch (e2) {} }
+  try { return JSON.parse(text.replace(/```json|```/g, '').trim()) }
+  catch (e) {
+    const m = text.match(/\{[\s\S]*\}/)
+    if (m) { try { return JSON.parse(m[0]) } catch (e2) {} }
     return null
   }
 }
@@ -39,8 +38,7 @@ async function callGroq(title, summary) {
     body: JSON.stringify({
       model: 'llama-3.3-70b-versatile',
       messages: [{ role: 'user', content: PROMPT(title, summary) }],
-      temperature: 0.1,
-      max_tokens: 300,
+      temperature: 0.1, max_tokens: 350,
       response_format: { type: 'json_object' },
     })
   })
@@ -50,21 +48,17 @@ async function callGroq(title, summary) {
 }
 
 const GEMINI_MODELS = ['gemini-2.0-flash', 'gemini-2.0-flash-exp', 'gemini-1.5-flash', 'gemini-2.5-flash']
-
 async function callGemini(title, summary) {
   let lastErr
   for (const model of GEMINI_MODELS) {
     try {
       const res = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_KEY}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+        { method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             contents: [{ parts: [{ text: PROMPT(title, summary) }] }],
-            generationConfig: { temperature: 0.1, maxOutputTokens: 300, responseMimeType: 'application/json' }
-          })
-        }
+            generationConfig: { temperature: 0.1, maxOutputTokens: 350, responseMimeType: 'application/json' }
+          }) }
       )
       if (!res.ok) { lastErr = new Error(`Gemini ${model} ${res.status}`); continue }
       const d = await res.json()
@@ -88,32 +82,28 @@ export default async function handler(req, res) {
   const { title, summary } = body || {}
   if (!title) return res.status(400).json({ error: 'title required' })
 
-  const [g, m] = await Promise.allSettled([
-    callGroq(title, summary),
-    callGemini(title, summary),
-  ])
+  const [g, m] = await Promise.allSettled([callGroq(title, summary), callGemini(title, summary)])
   const groq = g.status === 'fulfilled' ? g.value : null
   const gem = m.status === 'fulfilled' ? m.value : null
 
   if (!groq && !gem) {
-    return res.status(200).json({
-      confirmStatus: 'REVIEW', impact: 'LOW', instruments: [],
-      _debug: { groq: g.reason?.message || null, gemini: m.reason?.message || null }
-    })
+    return res.status(200).json({ confirmStatus: 'REVIEW', impact: 'LOW', instruments: [],
+      _debug: { groq: g.reason?.message || null, gemini: m.reason?.message || null } })
   }
 
+  // Pick the best available summary
+  const aiSummary = groq?.summary || gem?.summary || null
+
   let result
-  if (!groq) {
-    result = { confirmStatus: 'REVIEW', impact: gem.impact || 'LOW', instruments: gem.instruments || [], geminiAnalysis: gem }
-  } else if (!gem) {
-    result = { confirmStatus: 'REVIEW', impact: groq.impact || 'LOW', instruments: groq.instruments || [], groqAnalysis: groq }
-  } else {
+  if (!groq) result = { confirmStatus: 'REVIEW', impact: gem.impact || 'LOW', instruments: gem.instruments || [], aiSummary, geminiAnalysis: gem }
+  else if (!gem) result = { confirmStatus: 'REVIEW', impact: groq.impact || 'LOW', instruments: groq.instruments || [], aiSummary, groqAnalysis: groq }
+  else {
     const lvl = { HIGH: 2, MEDIUM: 1, LOW: 0 }
     const diff = Math.abs((lvl[groq.impact] ?? 0) - (lvl[gem.impact] ?? 0))
     const confirmStatus = diff === 0 ? 'CONFIRMED' : diff === 1 ? 'DISPUTED' : 'REVIEW'
     const impact = (lvl[groq.impact] ?? 0) >= (lvl[gem.impact] ?? 0) ? groq.impact : gem.impact
     const instruments = [...new Set([...(groq.instruments || []), ...(gem.instruments || [])])].slice(0, 6)
-    result = { confirmStatus, impact, instruments, groqAnalysis: groq, geminiAnalysis: gem }
+    result = { confirmStatus, impact, instruments, aiSummary, groqAnalysis: groq, geminiAnalysis: gem }
   }
   res.status(200).json(result)
 }
