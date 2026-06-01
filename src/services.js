@@ -2,19 +2,13 @@ import { createClient } from '@supabase/supabase-js'
 
 const GROQ_KEY = import.meta.env.VITE_GROQ_API_KEY
 const GEMINI_KEY = import.meta.env.VITE_GEMINI_API_KEY
+
 export const supabase = createClient(
   import.meta.env.VITE_SUPABASE_URL,
   import.meta.env.VITE_SUPABASE_KEY
 )
 
-const FEEDS = [
-  { url: 'https://finance.yahoo.com/news/rssindex', source: 'Yahoo Finance' },
-  { url: 'https://www.cnbc.com/id/100003114/device/rss/rss.html', source: 'CNBC' },
-  { url: 'https://feeds.reuters.com/reuters/businessNews', source: 'Reuters' },
-  { url: 'https://www.investing.com/rss/news.rss', source: 'Investing.com' },
-  { url: 'https://cryptopanic.com/news/rss/', source: 'CryptoPanic' },
-]
-
+// === HELPERS ===
 function timeAgo(date) {
   const s = Math.floor((new Date() - new Date(date)) / 1000)
   if (s < 60) return `${s}s ago`
@@ -23,102 +17,145 @@ function timeAgo(date) {
   return `${Math.floor(s / 86400)}d ago`
 }
 
-function parseXML(xmlString) {
-  const xml = new DOMParser().parseFromString(xmlString, 'text/xml')
-  return Array.from(xml.querySelectorAll('item')).map(item => ({
-    title: item.querySelector('title')?.textContent || '',
-    link: item.querySelector('link')?.textContent || '',
-    description: item.querySelector('description')?.textContent?.replace(/<[^>]*>/g, '').slice(0, 400) || '',
-    pubDate: item.querySelector('pubDate')?.textContent || new Date().toISOString(),
-  }))
+function makeId(title) {
+  return title.replace(/\s+/g, '-').toLowerCase().slice(0, 50)
 }
 
+// === NEWS FETCHING (via Vercel API) ===
 export async function fetchNews() {
-  const all = []
-  await Promise.allSettled(FEEDS.map(async ({ url, source }) => {
-    try {
-      const res = await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(url)}`)
-      const data = await res.json()
-      parseXML(data.contents).slice(0, 12).forEach(item => {
-        const id = item.title.replace(/\s+/g, '-').toLowerCase().slice(0, 50)
-        all.push({
-          id, title: item.title, summary: item.description, link: item.link,
-          source, time: timeAgo(item.pubDate), pubDate: item.pubDate,
-          impact: 'LOW', instruments: [], confirmStatus: 'ANALYZING',
-        })
-      })
-    } catch (e) { console.warn(`Feed failed: ${source}`) }
-  }))
-  const seen = new Set()
-  return all.filter(a => a.title && !seen.has(a.id) && seen.add(a.id))
-    .sort((a, b) => new Date(b.pubDate) - new Date(a.pubDate))
-    .slice(0, 60)
+  try {
+    const res = await fetch('/api/news')
+    if (!res.ok) throw new Error('News fetch failed')
+    const items = await res.json()
+    return items.map(item => ({
+      id: makeId(item.title),
+      title: item.title,
+      summary: item.description,
+      link: item.link,
+      source: item.source,
+      time: timeAgo(item.pubDate),
+      pubDate: item.pubDate,
+      impact: 'LOW',
+      instruments: [],
+      confirmStatus: 'ANALYZING',
+    }))
+  } catch (e) {
+    console.error('Failed to fetch news:', e)
+    return []
+  }
 }
 
+// === FULL ARTICLE FETCH ===
+export async function fetchFullArticle(url) {
+  try {
+    const res = await fetch(`/api/article?url=${encodeURIComponent(url)}`)
+    const data = await res.json()
+    return data.content || data.message || 'Unable to load article preview.'
+  } catch (e) {
+    return 'Unable to load article preview.'
+  }
+}
+
+// === SUPABASE CACHE ===
 export async function getCachedAnalyses(ids) {
   if (!ids.length) return {}
-  const { data } = await supabase.from('article_cache').select('*').in('id', ids)
-  const map = {}
-  ;(data || []).forEach(d => {
-    map[d.id] = {
-      impact: d.impact, instruments: d.instruments || [],
-      confirmStatus: d.confirm_status,
-      groqAnalysis: d.groq_analysis, geminiAnalysis: d.gemini_analysis,
-    }
-  })
-  return map
+  try {
+    const { data } = await supabase.from('article_cache').select('*').in('id', ids)
+    const map = {}
+    ;(data || []).forEach(d => {
+      map[d.id] = {
+        impact: d.impact,
+        instruments: d.instruments || [],
+        confirmStatus: d.confirm_status,
+        groqAnalysis: d.groq_analysis,
+        geminiAnalysis: d.gemini_analysis,
+      }
+    })
+    return map
+  } catch (e) {
+    return {}
+  }
 }
 
 async function cacheAnalysis(article, result) {
-  await supabase.from('article_cache').upsert({
-    id: article.id, title: article.title, source: article.source,
-    impact: result.impact, instruments: result.instruments,
-    confirm_status: result.confirmStatus,
-    groq_analysis: result.groqAnalysis || null,
-    gemini_analysis: result.geminiAnalysis || null,
-  })
+  try {
+    await supabase.from('article_cache').upsert({
+      id: article.id,
+      title: article.title,
+      source: article.source,
+      impact: result.impact,
+      instruments: result.instruments,
+      confirm_status: result.confirmStatus,
+      groq_analysis: result.groqAnalysis || null,
+      gemini_analysis: result.geminiAnalysis || null,
+    })
+  } catch (e) {
+    // Silently fail caching - not critical
+  }
 }
 
-const PROMPT = (title, summary) => `You are a financial markets analyst. Analyze this news headline and return ONLY a JSON object with no other text.
+// === AI ANALYSIS ===
+const PROMPT = (title, summary) => `You are an expert financial markets analyst. Analyze this news and return ONLY a JSON object, nothing else.
 
 Headline: "${title}"
-${summary ? `Summary: "${summary}"` : ''}
+${summary ? `Context: "${summary.slice(0, 300)}"` : ''}
 
-Return exactly:
-{"impact":"HIGH","instruments":["USD ↑","Gold ↓"],"verdict":"one sentence on market impact"}
+Return exactly this format:
+{"impact":"HIGH","instruments":["USD ↑","Gold ↓","S&P500 ↑"],"verdict":"One sentence on market impact"}
 
-Rules:
-- HIGH = Fed decisions, wars, crashes, major crises, surprise earnings
-- MEDIUM = regular earnings, economic data, OPEC, mergers
-- LOW = minor company news, routine updates
-- Add ↑ or ↓ to each instrument`
+Impact rules:
+- HIGH = Central bank decisions, wars/conflicts, market crashes, major surprise earnings, geopolitical crises, large M&A
+- MEDIUM = Regular earnings reports, economic data releases, OPEC decisions, sector news, analyst upgrades/downgrades
+- LOW = Minor company updates, routine news, lifestyle/non-market content
+
+Instrument rules:
+- Always include directional arrows (↑ for up, ↓ for down)
+- Use clear tickers: USD, EUR, GBP, JPY, Gold, Silver, Oil, S&P500, Nasdaq, BTC, ETH, AAPL, TSLA, etc.
+- Only include instruments clearly affected
+- Maximum 5 instruments`
 
 async function callGroq(title, summary) {
   const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
-    headers: { 'Authorization': `Bearer ${GROQ_KEY}`, 'Content-Type': 'application/json' },
+    headers: {
+      'Authorization': `Bearer ${GROQ_KEY}`,
+      'Content-Type': 'application/json',
+    },
     body: JSON.stringify({
       model: 'llama-3.3-70b-versatile',
       messages: [{ role: 'user', content: PROMPT(title, summary) }],
-      temperature: 0.1, max_tokens: 250,
+      temperature: 0.1,
+      max_tokens: 300,
+      response_format: { type: 'json_object' },
     })
   })
+  if (!res.ok) throw new Error(`Groq error: ${res.status}`)
   const d = await res.json()
-  return JSON.parse(d.choices?.[0]?.message?.content?.replace(/```json|```/g, '').trim() || '{}')
+  const text = d.choices?.[0]?.message?.content || '{}'
+  return JSON.parse(text.replace(/```json|```/g, '').trim())
 }
 
 async function callGemini(title, summary) {
+  // Using gemini-2.5-flash (current model, free tier)
   const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`,
-    { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_KEY}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         contents: [{ parts: [{ text: PROMPT(title, summary) }] }],
-        generationConfig: { temperature: 0.1, maxOutputTokens: 250 }
+        generationConfig: {
+          temperature: 0.1,
+          maxOutputTokens: 300,
+          responseMimeType: 'application/json',
+        }
       })
     }
   )
+  if (!res.ok) throw new Error(`Gemini error: ${res.status}`)
   const d = await res.json()
-  return JSON.parse(d.candidates?.[0]?.content?.parts?.[0]?.text?.replace(/```json|```/g, '').trim() || '{}')
+  const text = d.candidates?.[0]?.content?.parts?.[0]?.text || '{}'
+  return JSON.parse(text.replace(/```json|```/g, '').trim())
 }
 
 export async function analyzeWithBothAIs(article) {
@@ -129,59 +166,56 @@ export async function analyzeWithBothAIs(article) {
     ])
     const groq = g.status === 'fulfilled' ? g.value : null
     const gem = m.status === 'fulfilled' ? m.value : null
+
+    if (g.status === 'rejected') console.warn('Groq failed:', g.reason?.message)
+    if (m.status === 'rejected') console.warn('Gemini failed:', m.reason?.message)
+
     if (!groq && !gem) return { confirmStatus: 'REVIEW', impact: 'LOW', instruments: [] }
+
     let result
     if (!groq) result = { confirmStatus: 'REVIEW', impact: gem.impact, instruments: gem.instruments || [], geminiAnalysis: gem }
     else if (!gem) result = { confirmStatus: 'REVIEW', impact: groq.impact, instruments: groq.instruments || [], groqAnalysis: groq }
     else {
       const lvl = { HIGH: 2, MEDIUM: 1, LOW: 0 }
-      const diff = Math.abs(lvl[groq.impact] - lvl[gem.impact])
+      const diff = Math.abs((lvl[groq.impact] ?? 0) - (lvl[gem.impact] ?? 0))
       const confirmStatus = diff === 0 ? 'CONFIRMED' : diff === 1 ? 'DISPUTED' : 'REVIEW'
-      const impact = lvl[groq.impact] >= lvl[gem.impact] ? groq.impact : gem.impact
-      const instruments = [...new Set([...(groq.instruments || []), ...(gem.instruments || [])])]
+      const impact = (lvl[groq.impact] ?? 0) >= (lvl[gem.impact] ?? 0) ? groq.impact : gem.impact
+      const instruments = [...new Set([...(groq.instruments || []), ...(gem.instruments || [])])].slice(0, 6)
       result = { confirmStatus, impact, instruments, groqAnalysis: groq, geminiAnalysis: gem }
     }
     await cacheAnalysis(article, result)
     return result
-  } catch (e) { return { confirmStatus: 'REVIEW', impact: 'LOW', instruments: [] } }
+  } catch (e) {
+    return { confirmStatus: 'REVIEW', impact: 'LOW', instruments: [] }
+  }
 }
 
+// === WATCHLIST ===
 export async function getWatchlist() {
-  const { data } = await supabase.from('watchlist').select('*').order('created_at', { ascending: false })
-  return data || []
+  try {
+    const { data } = await supabase.from('watchlist').select('*').order('created_at', { ascending: false })
+    return data || []
+  } catch (e) { return [] }
 }
 export async function addToWatchlist(symbol, name, category) {
-  const { error } = await supabase.from('watchlist').insert({ symbol: symbol.toUpperCase(), name, category })
+  const { error } = await supabase.from('watchlist').insert({
+    symbol: symbol.toUpperCase().trim(),
+    name: name?.trim() || null,
+    category: category || 'Stock',
+  })
   return !error
 }
 export async function removeFromWatchlist(id) {
   await supabase.from('watchlist').delete().eq('id', id)
 }
+
+// === READ TRACKING ===
 export async function getReadArticleIds() {
-  const { data } = await supabase.from('read_articles').select('article_id')
-  return new Set((data || []).map(d => d.article_id))
+  try {
+    const { data } = await supabase.from('read_articles').select('article_id')
+    return new Set((data || []).map(d => d.article_id))
+  } catch (e) { return new Set() }
 }
 export async function markAsRead(articleId) {
   await supabase.from('read_articles').upsert({ article_id: articleId })
-}
-
-export async function fetchFullArticle(url) {
-  try {
-    const res = await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(url)}`)
-    const data = await res.json()
-    const doc = new DOMParser().parseFromString(data.contents, 'text/html')
-    const selectors = ['article', '[role="main"]', '.article-body', '.post-content', '.story-content', 'main']
-    let content = null
-    for (const sel of selectors) {
-      const el = doc.querySelector(sel)
-      if (el && el.textContent.length > 200) { content = el; break }
-    }
-    if (!content) content = doc.body
-    content.querySelectorAll('script, style, nav, header, footer, aside, iframe, .ad').forEach(el => el.remove())
-    const text = Array.from(content.querySelectorAll('p'))
-      .map(p => p.textContent.trim())
-      .filter(t => t.length > 30)
-      .join('\n\n')
-    return text.slice(0, 5000) || 'Article preview unavailable.'
-  } catch (e) { return 'Article preview unavailable.' }
 }
