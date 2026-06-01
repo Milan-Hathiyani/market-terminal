@@ -1,8 +1,5 @@
 import { createClient } from '@supabase/supabase-js'
 
-const GROQ_KEY = import.meta.env.VITE_GROQ_API_KEY
-const GEMINI_KEY = import.meta.env.VITE_GEMINI_API_KEY
-
 export const supabase = createClient(
   import.meta.env.VITE_SUPABASE_URL,
   import.meta.env.VITE_SUPABASE_KEY
@@ -46,14 +43,14 @@ export async function fetchNews() {
   }
 }
 
-// === FULL ARTICLE FETCH ===
+// === FULL ARTICLE ===
 export async function fetchFullArticle(url) {
   try {
     const res = await fetch(`/api/article?url=${encodeURIComponent(url)}`)
     const data = await res.json()
-    return data.content || data.message || 'Unable to load article preview.'
+    return data.content || data.message || 'Unable to load article.'
   } catch (e) {
-    return 'Unable to load article preview.'
+    return 'Unable to load article.'
   }
 }
 
@@ -91,112 +88,19 @@ async function cacheAnalysis(article, result) {
   } catch (e) {}
 }
 
-// === AI ANALYSIS ===
-const PROMPT = (title, summary) => `You are an expert financial markets analyst. Analyze this news and return ONLY a JSON object, nothing else.
-
-Headline: "${title}"
-${summary ? `Context: "${summary.slice(0, 300)}"` : ''}
-
-Return exactly this format:
-{"impact":"HIGH","instruments":["USD ↑","Gold ↓","S&P500 ↑"],"verdict":"One sentence on market impact"}
-
-Impact rules:
-- HIGH = Central bank decisions, wars/conflicts, market crashes, major surprise earnings, geopolitical crises, large M&A
-- MEDIUM = Regular earnings reports, economic data releases, OPEC decisions, sector news, analyst upgrades/downgrades
-- LOW = Minor company updates, routine news, lifestyle/non-market content
-
-Instrument rules:
-- Always include directional arrows (↑ for up, ↓ for down)
-- Use clear tickers: USD, EUR, GBP, JPY, Gold, Silver, Oil, S&P500, Nasdaq, BTC, ETH, AAPL, TSLA, etc.
-- Only include instruments clearly affected
-- Maximum 5 instruments`
-
-async function callGroq(title, summary) {
-  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${GROQ_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: 'llama-3.3-70b-versatile',
-      messages: [{ role: 'user', content: PROMPT(title, summary) }],
-      temperature: 0.1,
-      max_tokens: 300,
-      response_format: { type: 'json_object' },
-    })
-  })
-  if (!res.ok) {
-    const errText = await res.text()
-    throw new Error(`Groq ${res.status}: ${errText.slice(0, 100)}`)
-  }
-  const d = await res.json()
-  const text = d.choices?.[0]?.message?.content || '{}'
-  return JSON.parse(text.replace(/```json|```/g, '').trim())
-}
-
-// Try multiple Gemini models in order of preference
-const GEMINI_MODELS = ['gemini-2.0-flash', 'gemini-2.0-flash-exp', 'gemini-1.5-flash']
-
-async function callGemini(title, summary) {
-  let lastErr
-  for (const model of GEMINI_MODELS) {
-    try {
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_KEY}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: PROMPT(title, summary) }] }],
-            generationConfig: {
-              temperature: 0.1,
-              maxOutputTokens: 300,
-              responseMimeType: 'application/json',
-            }
-          })
-        }
-      )
-      if (!res.ok) {
-        const errText = await res.text()
-        lastErr = new Error(`Gemini ${model} ${res.status}: ${errText.slice(0, 150)}`)
-        continue
-      }
-      const d = await res.json()
-      const text = d.candidates?.[0]?.content?.parts?.[0]?.text || '{}'
-      return JSON.parse(text.replace(/```json|```/g, '').trim())
-    } catch (e) {
-      lastErr = e
-    }
-  }
-  throw lastErr || new Error('All Gemini models failed')
-}
-
+// === AI ANALYSIS (server-side) ===
 export async function analyzeWithBothAIs(article) {
   try {
-    const [g, m] = await Promise.allSettled([
-      callGroq(article.title, article.summary),
-      callGemini(article.title, article.summary),
-    ])
-    const groq = g.status === 'fulfilled' ? g.value : null
-    const gem = m.status === 'fulfilled' ? m.value : null
-
-    if (g.status === 'rejected') console.warn('Groq failed:', g.reason?.message)
-    if (m.status === 'rejected') console.warn('Gemini failed:', m.reason?.message)
-
-    if (!groq && !gem) return { confirmStatus: 'REVIEW', impact: 'LOW', instruments: [] }
-
-    let result
-    if (!groq) {
-      result = { confirmStatus: 'REVIEW', impact: gem.impact, instruments: gem.instruments || [], geminiAnalysis: gem }
-    } else if (!gem) {
-      result = { confirmStatus: 'REVIEW', impact: groq.impact, instruments: groq.instruments || [], groqAnalysis: groq }
-    } else {
-      const lvl = { HIGH: 2, MEDIUM: 1, LOW: 0 }
-      const diff = Math.abs((lvl[groq.impact] ?? 0) - (lvl[gem.impact] ?? 0))
-      const confirmStatus = diff === 0 ? 'CONFIRMED' : diff === 1 ? 'DISPUTED' : 'REVIEW'
-      const impact = (lvl[groq.impact] ?? 0) >= (lvl[gem.impact] ?? 0) ? groq.impact : gem.impact
-      const instruments = [...new Set([...(groq.instruments || []), ...(gem.instruments || [])])].slice(0, 6)
-      result = { confirmStatus, impact, instruments, groqAnalysis: groq, geminiAnalysis: gem }
+    const res = await fetch('/api/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: article.title, summary: article.summary }),
+    })
+    const result = await res.json()
+    // Cache only if we got real analysis
+    if (result.groqAnalysis || result.geminiAnalysis) {
+      await cacheAnalysis(article, result)
     }
-    await cacheAnalysis(article, result)
     return result
   } catch (e) {
     return { confirmStatus: 'REVIEW', impact: 'LOW', instruments: [] }
