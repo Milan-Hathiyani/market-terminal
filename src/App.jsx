@@ -1,55 +1,40 @@
 import { useState, useEffect, useCallback } from 'react'
-import { fetchNews, analyzeWithBothAIs } from './services'
+import { fetchNews, analyzeWithBothAIs, getCachedAnalyses, getWatchlist, addToWatchlist, removeFromWatchlist, getReadArticleIds, markAsRead, fetchFullArticle } from './services'
 
-const IMP = {
-  HIGH:   { bg:'#ef4444', text:'#fca5a5', border:'#7f1d1d' },
-  MEDIUM: { bg:'#f59e0b', text:'#fcd34d', border:'#78350f' },
-  LOW:    { bg:'#22c55e', text:'#86efac', border:'#14532d' },
-}
-const CON = {
-  CONFIRMED: { icon:'✅', color:'#4ade80', label:'CONFIRMED' },
-  DISPUTED:  { icon:'⚠️', color:'#fbbf24', label:'DISPUTED'  },
-  REVIEW:    { icon:'🔍', color:'#f87171', label:'REVIEW'    },
-  ANALYZING: { icon:'⏳', color:'#475569', label:'ANALYZING' },
-}
+const IMP = { HIGH:{bg:'#ef4444',text:'#fca5a5'}, MEDIUM:{bg:'#f59e0b',text:'#fcd34d'}, LOW:{bg:'#22c55e',text:'#86efac'} }
+const CON = { CONFIRMED:{icon:'✅',color:'#4ade80',label:'CONFIRMED'}, DISPUTED:{icon:'⚠️',color:'#fbbf24',label:'DISPUTED'}, REVIEW:{icon:'🔍',color:'#f87171',label:'REVIEW'}, ANALYZING:{icon:'⏳',color:'#475569',label:'ANALYZING'} }
 
 function useIsMobile() {
   const [m, setM] = useState(typeof window !== 'undefined' && window.innerWidth < 768)
-  useEffect(() => {
-    const h = () => setM(window.innerWidth < 768)
-    window.addEventListener('resize', h)
-    return () => window.removeEventListener('resize', h)
-  }, [])
+  useEffect(() => { const h = () => setM(window.innerWidth < 768); window.addEventListener('resize', h); return () => window.removeEventListener('resize', h) }, [])
   return m
 }
 
-function Card({ a, selected, onClick }) {
+function matchesWatch(article, watchlist) {
+  const text = `${article.title} ${article.summary||''} ${(article.instruments||[]).join(' ')}`
+  return watchlist.some(w => {
+    if (new RegExp(`\\b${w.symbol}\\b`, 'i').test(text)) return true
+    if (w.name && new RegExp(`\\b${w.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(text)) return true
+    return false
+  })
+}
+
+function Card({ a, selected, onClick, isRead, isWatched }) {
   const imp = IMP[a.impact] || IMP.LOW
   const con = CON[a.confirmStatus] || CON.ANALYZING
   return (
-    <div onClick={onClick} style={{
-      padding:'14px 18px', borderBottom:'1px solid #111118', cursor:'pointer',
-      background: selected ? '#091510' : 'transparent',
-      borderLeft: selected ? '3px solid #00ff88' : '3px solid transparent',
-    }}>
+    <div onClick={onClick} style={{padding:'14px 18px',borderBottom:'1px solid #111118',cursor:'pointer',background:selected?'#091510':'transparent',borderLeft:selected?'3px solid #00ff88':isWatched?'3px solid #f59e0b':'3px solid transparent',opacity:isRead&&!selected?0.55:1}}>
       <div style={{display:'flex',alignItems:'center',gap:'8px',marginBottom:'7px',flexWrap:'wrap'}}>
-        <span style={{background:imp.bg,color:'#fff',fontSize:'10px',fontWeight:'700',padding:'2px 8px',letterSpacing:'1px',flexShrink:0}}>
-          {a.impact}
-        </span>
-        <span style={{color:con.color,fontSize:'10px',fontWeight:'700'}}>
-          {con.icon} {con.label}
-        </span>
+        <span style={{background:imp.bg,color:'#fff',fontSize:'10px',fontWeight:'700',padding:'2px 8px',letterSpacing:'1px',flexShrink:0}}>{a.impact}</span>
+        <span style={{color:con.color,fontSize:'10px',fontWeight:'700'}}>{con.icon} {con.label}</span>
+        {isWatched && <span style={{color:'#f59e0b',fontSize:'12px'}}>★</span>}
         <span style={{color:'#334155',fontSize:'10px',marginLeft:'auto',flexShrink:0}}>{a.time}</span>
       </div>
       <div style={{color:'#334155',fontSize:'10px',marginBottom:'6px',letterSpacing:'0.5px'}}>{a.source}</div>
       <div style={{fontSize:'14px',lineHeight:'1.5',marginBottom:'10px',color:selected?'#e2e8f0':'#94a3b8',fontFamily:"'IBM Plex Sans',sans-serif",fontWeight:'500'}}>{a.title}</div>
       <div style={{display:'flex',flexWrap:'wrap',gap:'4px'}}>
         {(a.instruments||[]).slice(0,4).map((inst,i)=>(
-          <span key={i} style={{
-            fontSize:'11px',padding:'2px 7px',fontFamily:'monospace',fontWeight:'700',
-            border:`1px solid ${inst.includes('↑')?'#166534':inst.includes('↓')?'#7f1d1d':'#1e293b'}`,
-            color: inst.includes('↑')?'#4ade80':inst.includes('↓')?'#f87171':'#64748b',
-          }}>{inst}</span>
+          <span key={i} style={{fontSize:'11px',padding:'2px 7px',fontFamily:'monospace',fontWeight:'700',border:`1px solid ${inst.includes('↑')?'#166534':inst.includes('↓')?'#7f1d1d':'#1e293b'}`,color:inst.includes('↑')?'#4ade80':inst.includes('↓')?'#f87171':'#64748b'}}>{inst}</span>
         ))}
       </div>
     </div>
@@ -57,64 +42,100 @@ function Card({ a, selected, onClick }) {
 }
 
 function Reader({ a, onBack, isMobile }) {
-  if (!a) return (
-    <div style={{display:'flex',alignItems:'center',justifyContent:'center',height:'100%',color:'#1e293b',fontSize:'14px',fontFamily:'monospace'}}>
-      ← SELECT AN ARTICLE
-    </div>
-  )
+  const [fullContent, setFullContent] = useState(null)
+  const [loadingFull, setLoadingFull] = useState(false)
+  const [showFull, setShowFull] = useState(false)
+  useEffect(() => { setFullContent(null); setShowFull(false) }, [a?.id])
+  const loadFull = async () => {
+    if (fullContent) { setShowFull(true); return }
+    if (!a?.link) return
+    setLoadingFull(true)
+    setFullContent(await fetchFullArticle(a.link))
+    setShowFull(true); setLoadingFull(false)
+  }
+  if (!a) return <div style={{display:'flex',alignItems:'center',justifyContent:'center',height:'100%',color:'#1e293b',fontSize:'14px',fontFamily:'monospace'}}>← SELECT AN ARTICLE</div>
   const imp = IMP[a.impact] || IMP.LOW
   const con = CON[a.confirmStatus] || CON.ANALYZING
   return (
-    <div style={{padding: isMobile?'18px 16px':'28px 36px',overflow:'auto',height:'100%',fontFamily:"'IBM Plex Sans',sans-serif"}}>
-      {isMobile && (
-        <button onClick={onBack} style={{background:'transparent',border:'1px solid #1e293b',color:'#4ade80',padding:'6px 14px',fontSize:'11px',fontFamily:'monospace',cursor:'pointer',letterSpacing:'1px',marginBottom:'16px'}}>← BACK TO FEED</button>
-      )}
+    <div style={{padding:isMobile?'18px 16px':'28px 36px',overflow:'auto',height:'100%',fontFamily:"'IBM Plex Sans',sans-serif"}}>
+      {isMobile && <button onClick={onBack} style={{background:'transparent',border:'1px solid #1e293b',color:'#4ade80',padding:'6px 14px',fontSize:'11px',fontFamily:'monospace',cursor:'pointer',letterSpacing:'1px',marginBottom:'16px'}}>← BACK TO FEED</button>}
       <div style={{display:'flex',gap:'8px',flexWrap:'wrap',marginBottom:'16px',alignItems:'center'}}>
         <span style={{background:imp.bg,color:'#fff',fontSize:'10px',fontWeight:'700',padding:'3px 10px',letterSpacing:'2px'}}>{a.impact} IMPACT</span>
         <span style={{color:con.color,fontSize:'10px',fontWeight:'700',border:`1px solid ${con.color}40`,padding:'3px 10px',background:`${con.color}15`,letterSpacing:'1px'}}>{con.icon} {con.label}</span>
         <span style={{color:'#334155',fontSize:'11px',marginLeft:'auto',fontFamily:'monospace'}}>{a.source} · {a.time}</span>
       </div>
-      <h2 style={{fontSize: isMobile?'18px':'22px',lineHeight:'1.35',color:'#f1f5f9',marginBottom:'24px',fontWeight:'700'}}>{a.title}</h2>
-      {(a.instruments||[]).length > 0 && (
+      <h2 style={{fontSize:isMobile?'18px':'22px',lineHeight:'1.35',color:'#f1f5f9',marginBottom:'24px',fontWeight:'700'}}>{a.title}</h2>
+      {(a.instruments||[]).length>0 && (
         <div style={{marginBottom:'22px'}}>
           <div style={{fontSize:'10px',color:'#334155',letterSpacing:'2px',marginBottom:'8px',fontFamily:'monospace'}}>AFFECTED INSTRUMENTS</div>
           <div style={{display:'flex',flexWrap:'wrap',gap:'8px'}}>
-            {a.instruments.map((inst,i)=>(
-              <span key={i} style={{
-                fontSize:'13px',padding:'6px 14px',fontFamily:'monospace',fontWeight:'700',
-                border:`1px solid ${inst.includes('↑')?'#166534':inst.includes('↓')?'#7f1d1d':'#1e293b'}`,
-                color: inst.includes('↑')?'#4ade80':inst.includes('↓')?'#f87171':'#64748b',
-              }}>{inst}</span>
-            ))}
+            {a.instruments.map((inst,i)=>(<span key={i} style={{fontSize:'13px',padding:'6px 14px',fontFamily:'monospace',fontWeight:'700',border:`1px solid ${inst.includes('↑')?'#166534':inst.includes('↓')?'#7f1d1d':'#1e293b'}`,color:inst.includes('↑')?'#4ade80':inst.includes('↓')?'#f87171':'#64748b'}}>{inst}</span>))}
           </div>
         </div>
       )}
-      {a.confirmStatus !== 'ANALYZING' && (a.groqAnalysis || a.geminiAnalysis) && (
+      {a.confirmStatus!=='ANALYZING' && (a.groqAnalysis||a.geminiAnalysis) && (
         <div style={{marginBottom:'24px'}}>
           <div style={{fontSize:'10px',color:'#334155',letterSpacing:'2px',marginBottom:'10px',fontFamily:'monospace'}}>AI DUAL VERIFICATION</div>
           <div style={{display:'flex',gap:'10px',flexWrap:'wrap'}}>
-            {a.groqAnalysis && (
-              <div style={{flex:1,minWidth:'220px',background:'#091510',border:'1px solid #166534',padding:'14px 16px'}}>
-                <div style={{fontSize:'10px',color:'#4ade80',letterSpacing:'1px',marginBottom:'8px',fontFamily:'monospace'}}>◆ GROQ — LLAMA 3</div>
-                <div style={{fontSize:'11px',color:'#475569',marginBottom:'6px',fontFamily:'monospace'}}>IMPACT: <span style={{color:IMP[a.groqAnalysis.impact]?.text||'#fff',fontWeight:'700'}}>{a.groqAnalysis.impact}</span></div>
-                <div style={{fontSize:'13px',color:'#86efac',lineHeight:'1.6'}}>{a.groqAnalysis.verdict}</div>
-              </div>
-            )}
-            {a.geminiAnalysis && (
-              <div style={{flex:1,minWidth:'220px',background:'#090f1a',border:'1px solid #1e3a5f',padding:'14px 16px'}}>
-                <div style={{fontSize:'10px',color:'#60a5fa',letterSpacing:'1px',marginBottom:'8px',fontFamily:'monospace'}}>◆ GEMINI — GOOGLE</div>
-                <div style={{fontSize:'11px',color:'#475569',marginBottom:'6px',fontFamily:'monospace'}}>IMPACT: <span style={{color:IMP[a.geminiAnalysis.impact]?.text||'#fff',fontWeight:'700'}}>{a.geminiAnalysis.impact}</span></div>
-                <div style={{fontSize:'13px',color:'#93c5fd',lineHeight:'1.6'}}>{a.geminiAnalysis.verdict}</div>
-              </div>
-            )}
+            {a.groqAnalysis && <div style={{flex:1,minWidth:'220px',background:'#091510',border:'1px solid #166534',padding:'14px 16px'}}>
+              <div style={{fontSize:'10px',color:'#4ade80',letterSpacing:'1px',marginBottom:'8px',fontFamily:'monospace'}}>◆ GROQ — LLAMA 3</div>
+              <div style={{fontSize:'11px',color:'#475569',marginBottom:'6px',fontFamily:'monospace'}}>IMPACT: <span style={{color:IMP[a.groqAnalysis.impact]?.text||'#fff',fontWeight:'700'}}>{a.groqAnalysis.impact}</span></div>
+              <div style={{fontSize:'13px',color:'#86efac',lineHeight:'1.6'}}>{a.groqAnalysis.verdict}</div>
+            </div>}
+            {a.geminiAnalysis && <div style={{flex:1,minWidth:'220px',background:'#090f1a',border:'1px solid #1e3a5f',padding:'14px 16px'}}>
+              <div style={{fontSize:'10px',color:'#60a5fa',letterSpacing:'1px',marginBottom:'8px',fontFamily:'monospace'}}>◆ GEMINI — GOOGLE</div>
+              <div style={{fontSize:'11px',color:'#475569',marginBottom:'6px',fontFamily:'monospace'}}>IMPACT: <span style={{color:IMP[a.geminiAnalysis.impact]?.text||'#fff',fontWeight:'700'}}>{a.geminiAnalysis.impact}</span></div>
+              <div style={{fontSize:'13px',color:'#93c5fd',lineHeight:'1.6'}}>{a.geminiAnalysis.verdict}</div>
+            </div>}
           </div>
         </div>
       )}
       <div style={{borderTop:'1px solid #1e293b',paddingTop:'22px'}}>
         <p style={{fontSize:'15px',lineHeight:'1.9',color:'#94a3b8',marginBottom:'14px'}}><strong style={{color:'#cbd5e1'}}>{a.summary}</strong></p>
-        {a.link && (
-          <a href={a.link} target="_blank" rel="noopener noreferrer" style={{display:'inline-block',marginTop:'8px',color:'#00ff88',fontSize:'12px',textDecoration:'none',border:'1px solid #166534',padding:'7px 16px',fontFamily:'monospace',letterSpacing:'1px'}}>READ FULL ARTICLE →</a>
-        )}
+        {showFull && fullContent && <div style={{marginTop:'16px',padding:'18px',background:'#0d0d14',border:'1px solid #1e293b'}}>
+          {fullContent.split('\n\n').map((p,i)=>(<p key={i} style={{fontSize:'14px',lineHeight:'1.9',color:'#94a3b8',marginBottom:'14px'}}>{p}</p>))}
+        </div>}
+        <div style={{display:'flex',gap:'10px',marginTop:'16px',flexWrap:'wrap'}}>
+          {!showFull && <button onClick={loadFull} disabled={loadingFull} style={{background:'#00ff88',border:'none',color:'#0a0a0f',padding:'8px 18px',fontSize:'12px',fontFamily:'monospace',cursor:'pointer',letterSpacing:'1px',fontWeight:'700'}}>{loadingFull?'LOADING...':'📄 READ FULL ARTICLE'}</button>}
+          {a.link && <a href={a.link} target="_blank" rel="noopener noreferrer" style={{display:'inline-block',color:'#64748b',fontSize:'12px',textDecoration:'none',border:'1px solid #1e293b',padding:'8px 16px',fontFamily:'monospace',letterSpacing:'1px'}}>↗ OPEN ORIGINAL</a>}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function WatchPanel({ items, onAdd, onRemove, onClose }) {
+  const [symbol, setSymbol] = useState('')
+  const [name, setName] = useState('')
+  const [category, setCategory] = useState('Stock')
+  const handleAdd = async () => { if (!symbol) return; await onAdd(symbol, name, category); setSymbol(''); setName('') }
+  return (
+    <div style={{position:'fixed',top:0,right:0,bottom:0,width:'min(380px, 100%)',background:'#0a0a0f',borderLeft:'1px solid #1e293b',zIndex:100,display:'flex',flexDirection:'column'}}>
+      <div style={{padding:'14px 18px',borderBottom:'1px solid #1e293b',display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+        <span style={{color:'#f59e0b',fontWeight:'700',fontSize:'13px',letterSpacing:'2px',fontFamily:'monospace'}}>★ WATCHLIST</span>
+        <button onClick={onClose} style={{background:'transparent',border:'1px solid #1e293b',color:'#64748b',padding:'4px 10px',fontSize:'12px',cursor:'pointer',fontFamily:'monospace'}}>✕</button>
+      </div>
+      <div style={{padding:'16px 18px',borderBottom:'1px solid #1e293b'}}>
+        <div style={{fontSize:'10px',color:'#475569',letterSpacing:'2px',marginBottom:'10px',fontFamily:'monospace'}}>ADD NEW</div>
+        <input value={symbol} onChange={e=>setSymbol(e.target.value)} placeholder="Symbol (AAPL, BTC, Gold)" style={{width:'100%',background:'#0d0d14',border:'1px solid #1e293b',color:'#e2e8f0',padding:'8px 10px',fontSize:'12px',fontFamily:'monospace',marginBottom:'8px',outline:'none'}}/>
+        <input value={name} onChange={e=>setName(e.target.value)} placeholder="Full name (optional)" style={{width:'100%',background:'#0d0d14',border:'1px solid #1e293b',color:'#e2e8f0',padding:'8px 10px',fontSize:'12px',fontFamily:'monospace',marginBottom:'8px',outline:'none'}}/>
+        <select value={category} onChange={e=>setCategory(e.target.value)} style={{width:'100%',background:'#0d0d14',border:'1px solid #1e293b',color:'#e2e8f0',padding:'8px 10px',fontSize:'12px',fontFamily:'monospace',marginBottom:'10px',outline:'none'}}>
+          <option>Stock</option><option>Forex</option><option>Crypto</option><option>Commodity</option><option>Index</option>
+        </select>
+        <button onClick={handleAdd} style={{width:'100%',background:'#f59e0b',border:'none',color:'#0a0a0f',padding:'8px',fontSize:'12px',fontFamily:'monospace',cursor:'pointer',letterSpacing:'1px',fontWeight:'700'}}>+ ADD</button>
+      </div>
+      <div style={{flex:1,overflow:'auto'}}>
+        {items.length===0 && <div style={{padding:'20px',color:'#334155',fontSize:'12px',textAlign:'center',fontFamily:'monospace'}}>Empty — add your first</div>}
+        {items.map(item=>(
+          <div key={item.id} style={{padding:'12px 18px',borderBottom:'1px solid #111118',display:'flex',alignItems:'center',gap:'10px'}}>
+            <div style={{flex:1}}>
+              <div style={{color:'#f59e0b',fontWeight:'700',fontSize:'13px',fontFamily:'monospace'}}>{item.symbol}</div>
+              {item.name && <div style={{color:'#94a3b8',fontSize:'11px'}}>{item.name}</div>}
+              <div style={{color:'#475569',fontSize:'10px',fontFamily:'monospace',letterSpacing:'1px',marginTop:'2px'}}>{item.category}</div>
+            </div>
+            <button onClick={()=>onRemove(item.id)} style={{background:'transparent',border:'1px solid #7f1d1d',color:'#f87171',padding:'3px 8px',fontSize:'11px',cursor:'pointer',fontFamily:'monospace'}}>✕</button>
+          </div>
+        ))}
       </div>
     </div>
   )
@@ -126,16 +147,18 @@ export default function App() {
   const [selected, setSelected] = useState(null)
   const [filter, setFilter] = useState('ALL')
   const [loading, setLoading] = useState(true)
-  const [lastUpdated, setLastUpdated] = useState(null)
   const [tickerIdx, setTickerIdx] = useState(0)
-  const FILTERS = ['ALL','HIGH','CONFIRMED','STOCKS','FOREX','CRYPTO','OIL & GOLD']
+  const [watchlist, setWatchlist] = useState([])
+  const [readIds, setReadIds] = useState(new Set())
+  const [showWatch, setShowWatch] = useState(false)
+  const FILTERS = ['ALL','HIGH','CONFIRMED','★ WATCHING','STOCKS','FOREX','CRYPTO','OIL & GOLD']
 
   const analyzeOne = useCallback(async (article) => {
     const result = await analyzeWithBothAIs(article)
     setArticles(prev => prev.map(a => a.id === article.id ? {...a,...result} : a))
     if (result.impact === 'HIGH' && result.confirmStatus === 'CONFIRMED') {
       if ('Notification' in window && Notification.permission === 'granted')
-        new Notification(`🔴 ${article.title}`, {body: result.groqAnalysis?.verdict || ''})
+        new Notification(`🔴 ${article.title}`, {body: result.groqAnalysis?.verdict || '', icon: '/icon.svg'})
       try {
         const ctx = new (window.AudioContext || window.webkitAudioContext)()
         const o = ctx.createOscillator(); const g = ctx.createGain()
@@ -151,33 +174,39 @@ export default function App() {
   const loadNews = useCallback(async () => {
     try {
       const news = await fetchNews()
+      const cached = await getCachedAnalyses(news.map(n => n.id))
       setArticles(prev => {
         const map = {}; prev.forEach(a => map[a.id] = a)
-        return news.map(n => map[n.id] || n)
+        return news.map(n => ({ ...n, ...(map[n.id] || {}), ...(cached[n.id] || {}) }))
       })
-      setLastUpdated(new Date()); setLoading(false)
-      news.forEach(a => analyzeOne(a))
+      setLoading(false)
+      news.filter(n => !cached[n.id]).forEach(a => analyzeOne(a))
     } catch(e) { setLoading(false) }
   }, [analyzeOne])
 
   useEffect(() => {
     loadNews()
+    getWatchlist().then(setWatchlist)
+    getReadArticleIds().then(setReadIds)
     const t = setInterval(loadNews, 60000)
     if ('Notification' in window) Notification.requestPermission()
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(()=>{})
     return () => clearInterval(t)
   }, [loadNews])
 
-  useEffect(() => {
-    if (!articles.length) return
-    const t = setInterval(() => setTickerIdx(i => (i+1) % articles.length), 5000)
-    return () => clearInterval(t)
-  }, [articles.length])
+  useEffect(() => { if (!articles.length) return; const t = setInterval(()=>setTickerIdx(i=>(i+1)%articles.length), 5000); return ()=>clearInterval(t) }, [articles.length])
+
+  const handleSelect = async (a) => {
+    setSelected(a)
+    if (!readIds.has(a.id)) { await markAsRead(a.id); setReadIds(prev => new Set([...prev, a.id])) }
+  }
 
   const high = articles.filter(a => a.impact === 'HIGH')
   const filtered = articles.filter(a => {
     if (filter==='ALL') return true
     if (filter==='HIGH') return a.impact==='HIGH'
     if (filter==='CONFIRMED') return a.confirmStatus==='CONFIRMED'
+    if (filter==='★ WATCHING') return matchesWatch(a, watchlist)
     const inst = a.instruments||[]
     if (filter==='FOREX') return inst.some(i=>['USD','EUR','GBP','JPY','CAD','AUD','CHF'].some(x=>i.includes(x)))
     if (filter==='CRYPTO') return inst.some(i=>['BTC','ETH','Bitcoin','Crypto'].some(x=>i.includes(x)))
@@ -191,41 +220,28 @@ export default function App() {
 
   return (
     <div style={{fontFamily:"'IBM Plex Mono','Courier New',monospace",background:'#0a0a0f',color:'#e2e8f0',height:'100vh',display:'flex',flexDirection:'column',overflow:'hidden'}}>
-      <div style={{background:'#0d0d14',borderBottom:'1px solid #1e293b',padding:isMobile?'10px 14px':'11px 20px',display:'flex',alignItems:'center',gap:isMobile?'10px':'20px',flexShrink:0}}>
+      <div style={{background:'#0d0d14',borderBottom:'1px solid #1e293b',padding:isMobile?'10px 14px':'11px 20px',display:'flex',alignItems:'center',gap:'12px',flexShrink:0}}>
         <span style={{color:'#00ff88',fontWeight:'700',fontSize:isMobile?'12px':'15px',letterSpacing:isMobile?'2px':'3px'}}>◆ TERMINAL</span>
-        {!isMobile && <span style={{color:'#1e293b',fontSize:'11px',flex:1}}>{loading?'CONNECTING...':`${articles.length} ARTICLES · ${high.length} HIGH`}</span>}
+        {!isMobile && <span style={{color:'#1e293b',fontSize:'11px'}}>{loading?'CONNECTING...':`${articles.length} ARTICLES · ${high.length} HIGH`}</span>}
         <div style={{flex:1}}/>
-        <button onClick={loadNews} style={{background:'transparent',border:'1px solid #1e293b',color:'#4ade80',padding:'4px 10px',fontSize:'10px',fontFamily:'monospace',cursor:'pointer',letterSpacing:'1px'}}>↺ REFRESH</button>
+        <button onClick={()=>setShowWatch(true)} style={{background:'transparent',border:'1px solid #78350f',color:'#f59e0b',padding:'4px 10px',fontSize:'10px',fontFamily:'monospace',cursor:'pointer',letterSpacing:'1px'}}>★ {watchlist.length}</button>
+        <button onClick={loadNews} style={{background:'transparent',border:'1px solid #1e293b',color:'#4ade80',padding:'4px 10px',fontSize:'10px',fontFamily:'monospace',cursor:'pointer'}}>↺</button>
       </div>
-
       <div style={{background:'rgba(239,68,68,0.08)',borderBottom:'1px solid rgba(239,68,68,0.15)',padding:'6px 16px',fontSize:'11px',color:'#fca5a5',display:'flex',gap:'10px',alignItems:'center',flexShrink:0,overflow:'hidden'}}>
         <span style={{color:'#ef4444',fontWeight:'700',flexShrink:0,letterSpacing:'1px'}}>● LIVE</span>
         <span style={{overflow:'hidden',whiteSpace:'nowrap',textOverflow:'ellipsis'}}>{high[tickerIdx%Math.max(high.length,1)]?.title||articles[0]?.title||'Scanning feeds...'}</span>
       </div>
-
-      <div style={{background:'#0d0d14',borderBottom:'1px solid #1e293b',padding:'8px 12px',display:'flex',gap:'5px',flexShrink:0,flexWrap:'nowrap',overflowX:'auto',alignItems:'center'}}>
-        {FILTERS.map(f=>(
-          <button key={f} onClick={()=>setFilter(f)} style={{
-            background:filter===f?'#00ff88':'transparent',color:filter===f?'#0a0a0f':'#334155',
-            border:`1px solid ${filter===f?'#00ff88':'#1e293b'}`,padding:'4px 10px',fontSize:'10px',
-            fontFamily:'monospace',fontWeight:'700',cursor:'pointer',letterSpacing:'1px',flexShrink:0,
-          }}>{f}</button>
-        ))}
+      <div style={{background:'#0d0d14',borderBottom:'1px solid #1e293b',padding:'8px 12px',display:'flex',gap:'5px',flexShrink:0,overflowX:'auto',alignItems:'center'}}>
+        {FILTERS.map(f=>(<button key={f} onClick={()=>setFilter(f)} style={{background:filter===f?(f.includes('★')?'#f59e0b':'#00ff88'):'transparent',color:filter===f?'#0a0a0f':'#334155',border:`1px solid ${filter===f?(f.includes('★')?'#f59e0b':'#00ff88'):'#1e293b'}`,padding:'4px 10px',fontSize:'10px',fontFamily:'monospace',fontWeight:'700',cursor:'pointer',letterSpacing:'1px',flexShrink:0,whiteSpace:'nowrap'}}>{f}</button>))}
       </div>
-
       <div style={{display:'flex',flex:1,overflow:'hidden'}}>
-        {showFeed && (
-          <div style={{width:isMobile?'100%':'400px',borderRight:isMobile?'none':'1px solid #1e293b',overflow:'auto',flexShrink:0}}>
-            {loading && <div style={{padding:'24px',color:'#1e293b',fontSize:'12px',textAlign:'center',letterSpacing:'2px'}}>◆ LOADING...</div>}
-            {filtered.map(a=><Card key={a.id} a={a} selected={selected?.id===a.id} onClick={()=>setSelected(a)} />)}
-          </div>
-        )}
-        {showReader && (
-          <div style={{flex:1,overflow:'hidden',background:'#0a0a0f'}}>
-            <Reader a={selected} onBack={()=>setSelected(null)} isMobile={isMobile}/>
-          </div>
-        )}
+        {showFeed && <div style={{width:isMobile?'100%':'400px',borderRight:isMobile?'none':'1px solid #1e293b',overflow:'auto',flexShrink:0}}>
+          {loading && <div style={{padding:'24px',color:'#1e293b',fontSize:'12px',textAlign:'center',letterSpacing:'2px'}}>◆ LOADING...</div>}
+          {filtered.map(a=><Card key={a.id} a={a} selected={selected?.id===a.id} isRead={readIds.has(a.id)} isWatched={matchesWatch(a, watchlist)} onClick={()=>handleSelect(a)} />)}
+        </div>}
+        {showReader && <div style={{flex:1,overflow:'hidden',background:'#0a0a0f'}}><Reader a={selected} onBack={()=>setSelected(null)} isMobile={isMobile}/></div>}
       </div>
+      {showWatch && <WatchPanel items={watchlist} onAdd={async(s,n,c)=>{await addToWatchlist(s,n,c); setWatchlist(await getWatchlist())}} onRemove={async(id)=>{await removeFromWatchlist(id); setWatchlist(await getWatchlist())}} onClose={()=>setShowWatch(false)}/>}
     </div>
   )
 }

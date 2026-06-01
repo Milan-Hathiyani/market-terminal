@@ -1,0 +1,13 @@
+{
+  "name": "Market Terminal",
+  "short_name": "Terminal",
+  "description": "Real-time financial news with dual AI verification",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0a0a0f",
+  "theme_color": "#0a0a0f",
+  "orientation": "any",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
