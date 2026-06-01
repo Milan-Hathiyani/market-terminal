@@ -18,10 +18,10 @@ function timeAgo(date) {
 }
 
 function makeId(title) {
-  return title.replace(/\s+/g, '-').toLowerCase().slice(0, 50)
+  return title.replace(/[^a-z0-9]+/gi, '-').toLowerCase().slice(0, 60)
 }
 
-// === NEWS FETCHING (via Vercel API) ===
+// === NEWS FETCHING ===
 export async function fetchNews() {
   try {
     const res = await fetch('/api/news')
@@ -33,6 +33,7 @@ export async function fetchNews() {
       summary: item.description,
       link: item.link,
       source: item.source,
+      category: item.category,
       time: timeAgo(item.pubDate),
       pubDate: item.pubDate,
       impact: 'LOW',
@@ -72,9 +73,7 @@ export async function getCachedAnalyses(ids) {
       }
     })
     return map
-  } catch (e) {
-    return {}
-  }
+  } catch (e) { return {} }
 }
 
 async function cacheAnalysis(article, result) {
@@ -89,9 +88,7 @@ async function cacheAnalysis(article, result) {
       groq_analysis: result.groqAnalysis || null,
       gemini_analysis: result.geminiAnalysis || null,
     })
-  } catch (e) {
-    // Silently fail caching - not critical
-  }
+  } catch (e) {}
 }
 
 // === AI ANALYSIS ===
@@ -117,10 +114,7 @@ Instrument rules:
 async function callGroq(title, summary) {
   const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${GROQ_KEY}`,
-      'Content-Type': 'application/json',
-    },
+    headers: { 'Authorization': `Bearer ${GROQ_KEY}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
       model: 'llama-3.3-70b-versatile',
       messages: [{ role: 'user', content: PROMPT(title, summary) }],
@@ -129,33 +123,50 @@ async function callGroq(title, summary) {
       response_format: { type: 'json_object' },
     })
   })
-  if (!res.ok) throw new Error(`Groq error: ${res.status}`)
+  if (!res.ok) {
+    const errText = await res.text()
+    throw new Error(`Groq ${res.status}: ${errText.slice(0, 100)}`)
+  }
   const d = await res.json()
   const text = d.choices?.[0]?.message?.content || '{}'
   return JSON.parse(text.replace(/```json|```/g, '').trim())
 }
 
+// Try multiple Gemini models in order of preference
+const GEMINI_MODELS = ['gemini-2.0-flash', 'gemini-2.0-flash-exp', 'gemini-1.5-flash']
+
 async function callGemini(title, summary) {
-  // Using gemini-2.5-flash (current model, free tier)
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: PROMPT(title, summary) }] }],
-        generationConfig: {
-          temperature: 0.1,
-          maxOutputTokens: 300,
-          responseMimeType: 'application/json',
+  let lastErr
+  for (const model of GEMINI_MODELS) {
+    try {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_KEY}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: PROMPT(title, summary) }] }],
+            generationConfig: {
+              temperature: 0.1,
+              maxOutputTokens: 300,
+              responseMimeType: 'application/json',
+            }
+          })
         }
-      })
+      )
+      if (!res.ok) {
+        const errText = await res.text()
+        lastErr = new Error(`Gemini ${model} ${res.status}: ${errText.slice(0, 150)}`)
+        continue
+      }
+      const d = await res.json()
+      const text = d.candidates?.[0]?.content?.parts?.[0]?.text || '{}'
+      return JSON.parse(text.replace(/```json|```/g, '').trim())
+    } catch (e) {
+      lastErr = e
     }
-  )
-  if (!res.ok) throw new Error(`Gemini error: ${res.status}`)
-  const d = await res.json()
-  const text = d.candidates?.[0]?.content?.parts?.[0]?.text || '{}'
-  return JSON.parse(text.replace(/```json|```/g, '').trim())
+  }
+  throw lastErr || new Error('All Gemini models failed')
 }
 
 export async function analyzeWithBothAIs(article) {
@@ -173,9 +184,11 @@ export async function analyzeWithBothAIs(article) {
     if (!groq && !gem) return { confirmStatus: 'REVIEW', impact: 'LOW', instruments: [] }
 
     let result
-    if (!groq) result = { confirmStatus: 'REVIEW', impact: gem.impact, instruments: gem.instruments || [], geminiAnalysis: gem }
-    else if (!gem) result = { confirmStatus: 'REVIEW', impact: groq.impact, instruments: groq.instruments || [], groqAnalysis: groq }
-    else {
+    if (!groq) {
+      result = { confirmStatus: 'REVIEW', impact: gem.impact, instruments: gem.instruments || [], geminiAnalysis: gem }
+    } else if (!gem) {
+      result = { confirmStatus: 'REVIEW', impact: groq.impact, instruments: groq.instruments || [], groqAnalysis: groq }
+    } else {
       const lvl = { HIGH: 2, MEDIUM: 1, LOW: 0 }
       const diff = Math.abs((lvl[groq.impact] ?? 0) - (lvl[gem.impact] ?? 0))
       const confirmStatus = diff === 0 ? 'CONFIRMED' : diff === 1 ? 'DISPUTED' : 'REVIEW'
